@@ -239,29 +239,21 @@ extend the lease; older workers remain compatible.
 The 20Hz command cap compares the starts of SDK applications, not the time
 since the previous SDK acknowledgement. A regular 10Hz stream must not lose
 every other command just because a vendor call took 70ms of its 100ms period.
-When transport bunches arrivals closer than 50ms, the newest motion stays in
-the bounded inbox until the next permitted apply slot instead of being thrown
-away. Explicit zero always bypasses that pacing. TTL, observation-age and
-watchdog limits are unchanged.
+Nonzero arrivals closer than 50ms are dropped rather than buffered for a later
+apply slot. Explicit zero always bypasses that pacing. TTL, observation-age,
+watchdog limits and acceleration settings retain the bc14660 behavior.
 
-The bridged subscription callback only updates a bounded inbox and signals an
-event; it does not hold the plugin lock or wait for an SDK reply. One dedicated
-control thread consumes the latest command and performs synchronous SDK calls.
-Velocity execution no longer waits for a ROS timer or guard-condition callback
-to be scheduled alongside camera/depth processing. The event wakes on arrivals;
-an independent maximum-20ms wait bounds watchdog, standing and deferred-apply
-checks, without periodically replaying old commands. A separate priority zero slot clears
-older pending motion and cannot be overwritten by a later nonzero command;
-at most two messages are retained. Intermediate motion frames are coalesced,
-not queued in arrival order. Original timestamps/TTLs remain unchanged, so a
-frame that has expired while waiting is rejected rather than retimestamped or
-replayed. Pause, stop, configuration changes and restart clear pending input;
-old-generation receivers and workers cannot deliver motion to a new session.
-The thread starts only on card start. Stop confirms the chassis hold, signals
-termination, and joins outside the plugin state lock before closing SDK/ROS
-resources. A join timeout blocks restart instead of stacking another worker.
-A fully paused thread sleeps until resume/stop; unexpected control-loop errors
-hold the chassis, mark the worker failed and require explicit stop/start.
+The subscription callback passes each command directly through `ControlSink`
+and the existing SDK backend, which updates the held action with
+`setVelocity(vx, 0, wz)`. There is no Python velocity inbox, coalescing or
+dedicated dispatch thread. The existing C++ SDK worker remains unchanged.
+Only watchdog and standing checks use a 20ms ROS timer; that timer shares the
+plugin lock with the synchronous SDK call and may be delayed by it. The native
+worker independently enforces the original command lease. Nothing periodically
+replays old velocity commands. Pause and stop hold the chassis immediately;
+stop destroys the timer and SDK/ROS resources, and old-generation callbacks
+cannot deliver motion to a restarted session. Unexpected timer failures hold
+the chassis and require explicit stop/start.
 
 When the previous motion lease has expired, a capable native worker accepts
 the next fully validated fresh motion in one `UPDATE` request. It confirms any

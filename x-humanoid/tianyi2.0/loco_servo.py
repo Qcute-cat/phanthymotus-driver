@@ -20,102 +20,6 @@ WATCHDOG_MS = 300
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 
 
-class _LatestControlInbox:
-    """Short receiver lock, independent of the lock held during SDK requests.
-
-    Keep one latest motion and one priority zero command. The control worker
-    consumes them; the bridge reader never waits for a vendor call.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._active = False
-        self._generation = 0
-        self._motion = self._zero = None
-        self._received = self._coalesced = self._cleared = self._processed = 0
-        self._last_received_at = None
-        self._last_gap_ms = self._last_wait_ms = None
-
-    def activate(self, generation, active):
-        with self._lock:
-            self._cleared += int(self._motion is not None) + int(self._zero is not None)
-            self._motion = self._zero = None
-            self._generation, self._active = generation, active
-            self._last_received_at = None
-            self._last_gap_ms = None
-
-    def put(self, message, generation):
-        received_at = (time.monotonic(), int(time.time() * 1000))
-        try:
-            payload = json.loads(message.data)
-            values = payload.get("values") if isinstance(payload, dict) else None
-            zero = (isinstance(values, list) and len(values) == 6 and
-                    all(isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0
-                        for v in values))
-        except (ValueError, TypeError, AttributeError):
-            zero = False  # The consumer still validates/counts malformed input.
-        with self._lock:
-            if not self._active or generation is not None and generation != self._generation:
-                return False
-            now = received_at[0]
-            self._last_gap_ms = (round((now - self._last_received_at) * 1000, 1)
-                                 if self._last_received_at is not None else None)
-            self._last_received_at = now
-            self._received += 1
-            entry = (message, self._generation, *received_at)
-            if zero:
-                self._coalesced += int(self._motion is not None) + int(self._zero is not None)
-                self._motion, self._zero = None, entry
-            else:
-                self._coalesced += int(self._motion is not None)
-                self._motion = entry
-            return True
-
-    def take(self, allow_motion=True, *, newer_than=None):
-        with self._lock:
-            if not self._active:
-                return None
-            if self._zero is not None:
-                entry, self._zero = self._zero, None
-            elif allow_motion:
-                if newer_than is not None and self._motion is not None:
-                    # A confirmed stop may have blocked long enough for a new
-                    # frame to supersede the selected motion. Compare and pop
-                    # atomically; leave other streams/sequences for the sink's
-                    # normal arbitration. A pending zero always takes priority.
-                    try:
-                        candidate = json.loads(self._motion[0].data)
-                        source = newer_than.get("source")
-                        priority = candidate.get("priority", 0)
-                        seq, previous_seq = candidate.get("seq"), newer_than.get("seq")
-                        if not (isinstance(source, str) and source and
-                                candidate.get("source") == source and
-                                isinstance(priority, (int, float)) and not isinstance(priority, bool) and
-                                priority == newer_than.get("priority", 0) and
-                                isinstance(seq, int) and not isinstance(seq, bool) and
-                                isinstance(previous_seq, int) and not isinstance(previous_seq, bool) and
-                                seq > previous_seq):
-                            return None
-                    except (ValueError, TypeError, AttributeError):
-                        return None
-                entry, self._motion = self._motion, None
-            else:
-                return None
-            if entry is None:
-                return None
-            self._processed += 1
-            self._last_wait_ms = round((time.monotonic() - entry[2]) * 1000, 1)
-            return entry[0], entry[1], entry[2:]
-
-    def info(self):
-        with self._lock:
-            return {"active": self._active, "received": self._received,
-                    "processed": self._processed, "coalesced": self._coalesced,
-                    "cleared": self._cleared,
-                    "pending": int(self._motion is not None) + int(self._zero is not None),
-                    "last_receive_gap_ms": self._last_gap_ms, "last_wait_ms": self._last_wait_ms}
-
-
 def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0):
     return {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
@@ -159,11 +63,8 @@ class LocoServoPlugin:
         self._standing = None
         self._standing_at = None
         self._nodes = []
-        self._controller_thread = None
-        self._controller_stop = threading.Event()
-        self._controller_wake = threading.Event()
-        self._controller_failed = False
-        self._closing = False
+        self._watchdog_timer = None
+        self._watchdog_failed = False
         self._backend = None
         self._sink = None
         self._running = self._paused = False
@@ -182,7 +83,6 @@ class LocoServoPlugin:
         self._counts = {key: 0 for key in
                         ("received", "accepted", "published", "dry_run_commands",
                          "rejected", "dropped", "holds", "publish_errors", "refreshed_after_stop")}
-        self._inbox = _LatestControlInbox()
 
     @staticmethod
     def _positive(config, key, default):
@@ -224,39 +124,21 @@ class LocoServoPlugin:
         """Bundle lazy-start hook, intentionally inert."""
 
     def stop(self):
-        # Never join under _lock: the worker may already be waiting to acquire
-        # it. _closing prevents start from replacing resources during the join.
-        with self._stop_lock:
-            with self._lock:
-                self._inbox.activate(self._generation, False)
-                self._paused = True
-                self._hold()
-                if self._zero_pending:
-                    return {"state": "error", "error": "SDK stop unconfirmed; card remains paused"}
-                self._closing = True
-                self._running = False
-                self._generation += 1
-                self._controller_stop.set()
-                self._controller_wake.set()
-                worker = self._controller_thread
-            if worker is not None:
-                if worker is threading.current_thread():
-                    return {"state": "error", "error": "control worker cannot join itself; retry stop externally"}
-                worker.join(timeout=1.0)
-                if worker.is_alive():
-                    return {"state": "error", "error": "control worker has not stopped; restart blocked"}
-            with self._lock:
-                self._controller_thread = None
-                self._sink = None
-                self._close()
-                self._yielded = False
-                self._paused = False
-                self._closing = False
-                return {"state": "idle"}
+        with self._stop_lock, self._lock:
+            self._paused = True
+            self._hold()
+            if self._zero_pending:
+                return {"state": "error", "error": "SDK stop unconfirmed; card remains paused"}
+            self._running = False
+            self._generation += 1
+            self._close()
+            self._sink = None
+            self._yielded = self._paused = False
+            return {"state": "idle"}
 
     def dispatch(self, action, args):
         if action == "stop":
-            return self.stop()  # In particular, do not retain an outer RLock.
+            return self.stop()
         with self._lock:
             if action == "info":
                 return self._info()
@@ -268,14 +150,12 @@ class LocoServoPlugin:
                 if not self._running:
                     return {"state": "idle"}
                 if action == "resume":
-                    if self._controller_failed or (
-                            self._controller_thread is not None and not self._controller_thread.is_alive()):
-                        return {"state": "error", "error": "control worker stopped; stop/start the card"}
+                    if self._watchdog_failed:
+                        return {"state": "error", "error": "watchdog failed; stop/start the card"}
                     problem = self._conflict()
                     if problem:
                         return {"state": "error", "error": problem}
                     self._yielded = False
-                self._inbox.activate(self._generation, False)
                 self._paused = action == "pause"
                 self._hold()
                 if self._zero_pending:
@@ -288,14 +168,10 @@ class LocoServoPlugin:
                         self._paused = True
                         return {"state": "error", "error": str(exc)}
                 self._barrier_ms = int(time.time() * 1000)
-                self._inbox.activate(self._generation, not self._paused)
-                self._controller_wake.set()
                 return self._info()
         return None
 
     def _start(self, args):
-        if self._closing:
-            return {"state": "error", "error": "previous control worker is stopping; retry stop before restart"}
         topic = args.get("input_topic")
         if not topic:
             topics = args.get("input_topics")
@@ -324,57 +200,29 @@ class LocoServoPlugin:
             return {"state": "error", "error": f"loco_servo start failed: {exc}"}
         self._running = True
         self._paused = False
-        self._inbox.activate(self._generation, True)
         try:
-            self._start_controller(generation)
+            self._start_watchdog(generation)
         except Exception as exc:
             self._running = False
-            self._inbox.activate(self._generation, False)
-            self._controller_thread = None
             self._close()
             self._sink = None
-            return {"state": "error", "error": f"control worker start failed: {exc}"}
+            return {"state": "error", "error": f"watchdog start failed: {exc}"}
         return self._info()
 
-    def _start_controller(self, generation):
-        stop, wake = threading.Event(), threading.Event()
-        self._controller_failed = False
-        self._controller_stop, self._controller_wake = stop, wake
-        worker = threading.Thread(target=self._control_loop,
-                                  args=(generation, stop, wake),
-                                  name=f"tianyi-loco-control-{generation}", daemon=True)
-        self._controller_thread = worker
-        worker.start()
+    def _start_watchdog(self, generation):
+        self._watchdog_failed = False
+        node = self._nodes[0][0]
+        self._watchdog_timer = node.create_timer(0.02, lambda: self._timer_tick(generation))
 
-    def _control_loop(self, generation, stop, wake):
+    def _timer_tick(self, generation):
         try:
-            while not stop.is_set():
-                # Clear before processing: an arrival during a blocked SDK
-                # call stays signalled and is consumed on the very next pass.
-                wake.clear()
-                with self._lock:
-                    if not self._running or generation != self._generation:
-                        return
-                self._tick(generation)
-                if stop.is_set():
-                    return
-                with self._lock:
-                    delay = None if self._paused and not self._zero_pending else 0.02
-                    # Active watchdog/standing checks remain bounded; a fully
-                    # paused worker sleeps until resume or stop wakes it.
-                    if not self._paused and self._inbox.info()["pending"]:
-                        due_in = (self._last_output_at + 1 / 20 - time.monotonic()
-                                  if self._last_output_at is not None else 0)
-                        delay = max(0, min(delay, due_in))
-                wake.wait(delay)
+            self._tick(generation)
         except Exception as exc:
             with self._lock:
                 if generation == self._generation and self._running:
-                    self._controller_failed = True
-                    self._paused = True
-                    self._inbox.activate(generation, False)
+                    self._watchdog_failed = self._paused = True
                     self._hold()
-                    self._record("ERROR", f"control worker failed: {exc}")
+                    self._record("ERROR", f"watchdog failed: {exc}")
 
     def _open(self, topic, generation):
         from rclpy.node import Node
@@ -401,9 +249,12 @@ class LocoServoPlugin:
             self._ros2.executor_tianyi.add_node(body)
 
     def _close(self):
-        self._inbox.activate(self._generation, False)
-        self._controller_stop.set()
-        self._controller_wake.set()
+        timer, self._watchdog_timer = self._watchdog_timer, None
+        if timer is not None and self._nodes:
+            try:
+                self._nodes[0][0].destroy_timer(timer)
+            except Exception as exc:
+                self._record("ERROR", f"watchdog teardown failed: {exc}")
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -425,7 +276,6 @@ class LocoServoPlugin:
                 return
             self._standing = message.data if isinstance(message.data, bool) else None
             self._standing_at = time.monotonic()
-            self._controller_wake.set()
 
     def _standing_problem(self):
         if not self._settings["require_standing"]:
@@ -440,10 +290,10 @@ class LocoServoPlugin:
         self._last = {"verdict": verdict, "reason": reason, **extra}
 
     def _on_message(self, message, generation=None):
-        # No plugin/SDK lock here: waiting on it would block the socket reader
-        # and accumulate already-aging commands in the Unix socket buffer.
-        if self._inbox.put(message, generation):
-            self._controller_wake.set()
+        # Like R1, a message passes ControlSink and writes the SDK in this
+        # callback. No Python inbox, dispatch worker or velocity replay.
+        received_at = (time.monotonic(), int(time.time() * 1000))
+        self._process_message(message, generation, received_at)
 
     def _process_message(self, message, generation=None, received_at=None):
         with self._lock:
@@ -476,15 +326,6 @@ class LocoServoPlugin:
                         self._hold()  # Native lease may already have stopped the chassis.
                         if self._zero_pending:
                             raise RuntimeError("SDK stop unconfirmed")
-                        pending = self._inbox.take(newer_than=command)
-                        if pending is not None:
-                            self._counts["dropped"] += 1
-                            self._counts["refreshed_after_stop"] += 1
-                            # Revalidate the replacement, including the original
-                            # TTL, observation age, seq and source arbitration.
-                            # _hold cleared the lease, so this refresh is once.
-                            self._process_message(*pending)
-                            return
                     problem = self._standing_problem()
                     if problem:
                         self._hold()
@@ -644,19 +485,7 @@ class LocoServoPlugin:
                 if self._zero_pending:
                     self._paused = True
             if self._paused:
-                self._inbox.activate(self._generation, False)
                 return
-            # A burst after transport jitter is not proof that Navi computed
-            # commands above 20Hz. Keep its latest motion until the next apply
-            # slot rather than throwing it away. Zero commands never wait.
-            motion_due = self._last_output_at is None or (
-                time.monotonic() - self._last_output_at >= 1 / 20)
-            pending = self._inbox.take(allow_motion=motion_due)
-            if pending is not None:
-                self._process_message(*pending)
-                if self._paused:
-                    self._inbox.activate(self._generation, False)
-                    return
             if self._standing_problem() and any(self._last_output):
                 self._hold()
                 self._record("REFUSED", self._standing_problem())
@@ -673,7 +502,6 @@ class LocoServoPlugin:
         if any(not isinstance(value, bool) for value in updates.values()):
             return {"state": "error", "error": "configuration toggles must be boolean"}
         if any(self._settings[key] != value for key, value in updates.items()):
-            self._inbox.activate(self._generation, False)
             # Stop under the OLD mode, especially before enabling dry_run.
             if self._running:
                 self._hold()
@@ -684,18 +512,14 @@ class LocoServoPlugin:
                     try:
                         self._backend.connect()
                     except Exception as exc:
-                        self._inbox.activate(self._generation, not self._paused and not self._yielded)
                         return {"state": "error", "error": str(exc), "dry_run": self._settings["dry_run"]}
             self._settings.update(updates)
             self._barrier_ms = int(time.time() * 1000)
-            self._inbox.activate(self._generation,
-                                 self._running and not self._paused and not self._yielded)
         return {"ok": True, **self._info()}
 
     def pause_for_explicit_command(self, reason=""):
         with self._lock:
             if self._running:
-                self._inbox.activate(self._generation, False)
                 self._paused = True
                 self._hold()
                 if self._zero_pending:
@@ -710,17 +534,15 @@ class LocoServoPlugin:
         interface = copy.deepcopy(self._descriptor)
         interface.update({key: self._settings[key] for key in ("dry_run", "rotate_only")})
         return {
-            "state": "stopping" if self._closing else "paused" if self._running and self._paused else "running" if self._running else "idle",
+            "state": "paused" if self._running and self._paused else "running" if self._running else "idle",
             "input": self._input_topic, **self._settings,
             "yielded_to_explicit_command": self._yielded,
             "control_interface": interface,
             "counts": dict(self._counts), "last": copy.deepcopy(self._last),
-            "input_queue": self._inbox.info(),
-            "dispatch": {"mode": "dedicated_worker", "watchdog_poll_ms": 20,
-                         "max_apply_hz": 20, "worker_failed": self._controller_failed,
+            "dispatch": {"mode": "direct_callback", "watchdog_poll_ms": 20,
+                         "max_apply_hz": 20, "watchdog_failed": self._watchdog_failed,
                          "expiry_update": "native_atomic" if self._native_expiry_update() else "stop_then_set",
-                         "worker_alive": bool(
-                             self._controller_thread and self._controller_thread.is_alive())},
+                         "watchdog_active": self._watchdog_timer is not None},
             "last_command_timing": copy.deepcopy(self._last_timing),
             "output": list(self._last_output), "output_topic": None,
             "backend": self._backend.info() if self._backend is not None else
